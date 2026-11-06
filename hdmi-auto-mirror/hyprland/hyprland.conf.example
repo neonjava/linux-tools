@@ -1,0 +1,8 @@
+# Add these lines to your Hyprland config.
+
+# Start the hotplug daemon
+exec-once = ~/.local/bin/hdmi-auto-mirror --daemon
+
+# Keybinds
+bind = SUPER SHIFT, M, exec, ~/.local/bin/hdmi-display-menu
+bind = SUPER CTRL, M, exec, ~/.local/bin/hdmi-auto-mirror --toggle

@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""
+HDMI Auto-Mirror Tool for Hyprland and GNOME
+Automatically detects when an HDMI or external display / TV is connected
+and mirrors the system's primary display (e.g. eDP-1 laptop screen) to it.
+Also automatically manages audio routing to HDMI/TV and restores internal audio upon disconnect.
+
+The desktop is detected at runtime: Hyprland is driven through hyprctl and its
+IPC socket, GNOME through Mutter's org.gnome.Mutter.DisplayConfig D-Bus API.
+"""
+
+import os
+import sys
+import time
+import json
+import socket
+import signal
+import fcntl
+import argparse
+import subprocess
+from pathlib import Path
+
+LOCK_FILE = f"/tmp/hdmi-auto-mirror-{os.getuid()}.lock"
+LOG_FILE = Path.home() / ".local" / "state" / "hdmi-auto-mirror.log"
+
+MUTTER_BUS = "org.gnome.Mutter.DisplayConfig"
+MUTTER_PATH = "/org/gnome/Mutter/DisplayConfig"
+MUTTER_PERSISTENT = 2  # ApplyMonitorsConfig method: apply and save to monitors.xml
+
+
+def log(message: str):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {message}"
+    print(formatted, flush=True)
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(formatted + "\n")
+    except Exception:
+        pass
+
+
+def notify(title: str, message: str, icon: str = "video-display", urgency: str = "normal"):
+    try:
+        subprocess.run(
+            [
+                "notify-send",
+                "-a", "HDMI Auto-Mirror",
+                "-i", icon,
+                "-u", urgency,
+                title,
+                message
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def socket_alive(path: str) -> bool:
+    """A leftover socket file from an ended session refuses connections."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1)
+            probe.connect(path)
+        return True
+    except OSError:
+        return False
+
+
+def get_hyprland_socket_path() -> str:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    hypr_base = os.path.join(runtime_dir, "hypr")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+
+    candidates = [sig] if sig else []
+    if os.path.isdir(hypr_base):
+        candidates += [entry for entry in os.listdir(hypr_base) if entry != sig]
+
+    for entry in candidates:
+        path = os.path.join(hypr_base, entry, ".socket2.sock")
+        if socket_alive(path):
+            # hyprctl needs this too when we were started outside Hyprland
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = entry
+            return path
+
+    return ""
+
+
+def gnome_available() -> bool:
+    try:
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = bus.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "NameHasOwner", GLib.Variant("(s)", (MUTTER_BUS,)), None,
+            Gio.DBusCallFlags.NONE, 2000, None,
+        )
+        return reply.unpack()[0]
+    except Exception:
+        return False
+
+
+def detect_backend() -> str:
+    if get_hyprland_socket_path():
+        return "hyprland"
+    if gnome_available():
+        return "gnome"
+    return ""
+
+
+def run_hyprctl(args: list[str]) -> str:
+    cmd = ["hyprctl"] + args
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.stdout.strip()
+
+
+def get_hyprland_monitors() -> list[dict]:
+    try:
+        out = run_hyprctl(["monitors", "all", "-j"])
+        if not out:
+            out = run_hyprctl(["monitors", "-j"])
+        monitors = json.loads(out)
+    except Exception as e:
+        log(f"Error fetching monitors: {e}")
+        return []
+
+    # Hyprland reports mirrorOf as a monitor id; everything here compares names
+    names = {str(m.get("id")): m.get("name") for m in monitors}
+    for m in monitors:
+        mirror = str(m.get("mirrorOf", "none"))
+        m["mirrorOf"] = names.get(mirror, "none" if mirror in ("none", "", "-1") else mirror)
+    return monitors
+
+
+def gnome_call(method: str, args=None):
+    from gi.repository import Gio
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return bus.call_sync(
+        MUTTER_BUS, MUTTER_PATH, MUTTER_BUS, method, args, None,
+        Gio.DBusCallFlags.NONE, 10000, None,
+    )
+
+
+def gnome_state() -> dict:
+    serial, monitors, logical, props = gnome_call("GetCurrentState").unpack()
+    return {
+        "serial": serial,
+        "props": props,
+        # connector -> {"modes": [...], "props": {...}}
+        "monitors": {
+            spec[0]: {
+                "vendor": spec[1],
+                "product": spec[2],
+                "modes": [
+                    {
+                        "id": mode[0], "width": mode[1], "height": mode[2],
+                        "refresh": mode[3], "preferred_scale": mode[4],
+                        "scales": mode[5], "props": mode[6],
+                    }
+                    for mode in modes
+                ],
+                "props": mon_props,
+            }
+            for spec, modes, mon_props in monitors
+        },
+        "logical": [
+            {
+                "scale": lm[2], "transform": lm[3], "primary": lm[4],
+                "connectors": [spec[0] for spec in lm[5]],
+            }
+            for lm in logical
+        ],
+    }
+
+
+def gnome_mode(monitor: dict, flag: str) -> dict | None:
+    return next((m for m in monitor["modes"] if m["props"].get(flag)), None)
+
+
+def get_gnome_monitors() -> list[dict]:
+    try:
+        state = gnome_state()
+    except Exception as e:
+        log(f"Error fetching monitors: {e}")
+        return []
+
+    result = []
+    for name, mon in state["monitors"].items():
+        group = next((lm["connectors"] for lm in state["logical"] if name in lm["connectors"]), [])
+        # Monitors sharing a logical monitor are mirrors; the builtin panel leads
+        leader = next(
+            (c for c in group if state["monitors"][c]["props"].get("is-builtin")),
+            group[0] if group else name,
+        )
+        mode = gnome_mode(mon, "is-current") or {}
+        result.append({
+            "name": name,
+            "description": mon["props"].get("display-name", f"{mon['vendor']} {mon['product']}"),
+            "width": mode.get("width"),
+            "height": mode.get("height"),
+            "refreshRate": mode.get("refresh", 0),
+            "mirrorOf": leader if leader != name else "none",
+            "disabled": not group,
+        })
+    return result
+
+
+def get_monitors() -> list[dict]:
+    backend = detect_backend()
+    if backend == "hyprland":
+        return get_hyprland_monitors()
+    if backend == "gnome":
+        return get_gnome_monitors()
+    log("No running Hyprland or GNOME session found.")
+    return []
+
+
+def detect_source_monitor(monitors: list[dict], forced_source: str = "") -> str:
+    if forced_source:
+        for m in monitors:
+            if m.get("name") == forced_source and not m.get("disabled", False):
+                return forced_source
+
+    # Look for eDP-1, eDP-2 (laptop internal display)
+    for m in monitors:
+        name = m.get("name", "")
+        if name.startswith("eDP") and not m.get("disabled", False):
+            return name
+
+    # Fallback to first non-headless, non-mirror monitor
+    for m in monitors:
+        name = m.get("name", "")
+        mirror = m.get("mirrorOf", "none")
+        if not name.startswith("HEADLESS") and (mirror == "none" or not mirror) and not m.get("disabled", False):
+            return name
+
+    return monitors[0].get("name", "eDP-1") if monitors else "eDP-1"
+
+
+def get_audio_sinks() -> list[dict]:
+    sinks = []
+    try:
+        out = subprocess.run(["pactl", "list", "sinks", "short"], capture_output=True, text=True).stdout
+        for line in out.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                sinks.append({
+                    "id": parts[0],
+                    "name": parts[1],
+                    "driver": parts[2] if len(parts) > 2 else "",
+                    "state": parts[-1] if len(parts) > 3 else ""
+                })
+    except Exception:
+        pass
+    return sinks
+
+
+def switch_audio_to_hdmi() -> bool:
+    sinks = get_audio_sinks()
+    hdmi_sink = None
+    for s in sinks:
+        name_l = s["name"].lower()
+        if "hdmi" in name_l:
+            hdmi_sink = s["name"]
+            break
+
+    if hdmi_sink:
+        try:
+            subprocess.run(["pactl", "set-default-sink", hdmi_sink], check=True)
+            log(f"Switched default audio sink to HDMI: {hdmi_sink}")
+            notify("Audio Output", "Switched audio output to TV / HDMI", "audio-speakers", "low")
+            return True
+        except Exception as e:
+            log(f"Failed to switch audio sink: {e}")
+    return False
+
+
+def restore_default_audio() -> bool:
+    sinks = get_audio_sinks()
+    analog_sink = None
+    for s in sinks:
+        name_l = s["name"].lower()
+        # "hdmi-stereo" sinks also contain "stereo"
+        if "hdmi" not in name_l and ("analog" in name_l or "stereo" in name_l):
+            analog_sink = s["name"]
+            break
+
+    if analog_sink:
+        try:
+            subprocess.run(["pactl", "set-default-sink", analog_sink], check=True)
+            log(f"Restored default audio sink to Internal: {analog_sink}")
+            notify("Audio Output", "Restored audio output to Internal Speakers", "audio-speakers", "low")
+            return True
+        except Exception as e:
+            log(f"Failed to restore audio sink: {e}")
+    return False
+
+
+def gnome_apply(state: dict, logical: list) -> bool:
+    from gi.repository import GLib
+    props = {}
+    if state["props"].get("supports-changing-layout-mode"):
+        props["layout-mode"] = GLib.Variant("u", state["props"].get("layout-mode", 1))
+    try:
+        gnome_call("ApplyMonitorsConfig", GLib.Variant(
+            "(uua(iiduba(ssa{sv}))a{sv})",
+            (state["serial"], MUTTER_PERSISTENT, logical, props),
+        ))
+        return True
+    except Exception as e:
+        log(f"GNOME rejected the display configuration: {e}")
+        notify("Display Error", "GNOME rejected the display configuration", "dialog-error", "normal")
+        return False
+
+
+def gnome_scale(state: dict, name: str, mode: dict) -> float:
+    """Keep the scale a monitor already uses if the new mode supports it."""
+    current = next((lm["scale"] for lm in state["logical"] if name in lm["connectors"]), None)
+    return current if current in mode["scales"] else mode["preferred_scale"]
+
+
+def gnome_mirror(source: str) -> bool:
+    state = gnome_state()
+    monitors = state["monitors"]
+    if source not in monitors:
+        log(f"Source monitor {source} not found.")
+        return False
+
+    # Mutter mirrors by putting monitors in one logical monitor, and those must
+    # all be the same size, so use the largest resolution every monitor offers.
+    def usable(mon):
+        return [m for m in mon["modes"] if not m["props"].get("is-interlaced")]
+
+    sizes = set.intersection(*({(m["width"], m["height"]) for m in usable(mon)} for mon in monitors.values()))
+    if not sizes:
+        log("Cannot mirror: the displays have no resolution in common.")
+        notify("Display Error", "Cannot mirror: no resolution in common", "dialog-error", "normal")
+        return False
+    width, height = max(sizes, key=lambda size: size[0] * size[1])
+
+    chosen = {
+        name: max(
+            (m for m in usable(mon) if (m["width"], m["height"]) == (width, height)),
+            key=lambda m: m["refresh"],
+        )
+        for name, mon in monitors.items()
+    }
+
+    scale = gnome_scale(state, source, chosen[source])
+    if not all(scale in mode["scales"] for mode in chosen.values()):
+        scale = 1.0
+    transform = next((lm["transform"] for lm in state["logical"] if source in lm["connectors"]), 0)
+
+    log(f"Mirroring at {width}x{height}: " + ", ".join(f"{n}={m['id']}" for n, m in chosen.items()))
+    return gnome_apply(state, [
+        (0, 0, scale, transform, True, [(name, mode["id"], {}) for name, mode in chosen.items()]),
+    ])
+
+
+def gnome_extend(source: str) -> bool:
+    state = gnome_state()
+    if source not in state["monitors"]:
+        log(f"Source monitor {source} not found.")
+        return False
+
+    logical_layout = state["props"].get("layout-mode", 1) == 1
+    logical, x = [], 0
+    for name in [source] + [n for n in state["monitors"] if n != source]:
+        mon = state["monitors"][name]
+        mode = gnome_mode(mon, "is-preferred") or mon["modes"][0]
+        scale = gnome_scale(state, name, mode)
+        transform = next(
+            (lm["transform"] for lm in state["logical"] if name == source and name in lm["connectors"]),
+            0,
+        )
+        logical.append((x, 0, scale, transform, name == source, [(name, mode["id"], {})]))
+        width = mode["height"] if transform % 2 else mode["width"]
+        x += round(width / scale) if logical_layout else width
+    return gnome_apply(state, logical)
+
+
+def set_mirror(targets: list[str], source: str, manage_audio: bool = True):
+    log(f"Configuring {', '.join(targets)} to mirror source {source}...")
+    if detect_backend() == "gnome":
+        if not gnome_mirror(source):
+            return
+    else:
+        for target in targets:
+            # Hyprland monitor rule: monitor = name, res@refresh, pos, scale, mirror, target
+            rule = f"{target},preferred,auto,1,mirror,{source}"
+            res = run_hyprctl(["keyword", "monitor", rule])
+            log(f"Applied hyprctl keyword monitor '{rule}' -> Result: {res}")
+    notify("Display Connected", f"Screen mirrored to {', '.join(targets)} (Source: {source})", "video-display", "normal")
+
+    if manage_audio:
+        # Give PipeWire a brief moment to detect the HDMI audio profile
+        time.sleep(0.5)
+        switch_audio_to_hdmi()
+
+
+def set_extend(targets: list[str], source: str):
+    log(f"Configuring {', '.join(targets)} as extended display...")
+    if detect_backend() == "gnome":
+        if not gnome_extend(source):
+            return
+    else:
+        for target in targets:
+            rule = f"{target},preferred,auto,1"
+            res = run_hyprctl(["keyword", "monitor", rule])
+            log(f"Applied hyprctl keyword monitor '{rule}' -> Result: {res}")
+    notify("Display Mode", f"Extended display active on {', '.join(targets)}", "video-display", "normal")
+
+
+def external_monitors(monitors: list[dict], source: str) -> list[dict]:
+    return [m for m in monitors if m.get("name") != source and not m.get("name", "").startswith("HEADLESS")]
+
+
+def sync_monitors(forced_source: str = "", manage_audio: bool = True, mode: str = "mirror"):
+    monitors = get_monitors()
+    if not monitors:
+        log("No monitors detected.")
+        return
+
+    source = detect_source_monitor(monitors, forced_source)
+    log(f"Active source monitor: {source}")
+
+    externals = external_monitors(monitors, source)
+    if not externals:
+        return
+
+    names = [m["name"] for m in externals]
+    if mode == "mirror":
+        if any(m.get("mirrorOf", "none") != source for m in externals):
+            set_mirror(names, source, manage_audio)
+        else:
+            log(f"{', '.join(names)} already mirroring {source}.")
+            # A saved layout can come back on replug with nothing left to apply
+            if manage_audio:
+                time.sleep(0.5)
+                switch_audio_to_hdmi()
+    elif mode == "extend":
+        if any(m.get("mirrorOf", "none") != "none" or m.get("disabled", False) for m in externals):
+            set_extend(names, source)
+        else:
+            log(f"{', '.join(names)} already in extend mode.")
+
+
+def toggle_display_mode(forced_source: str = "", manage_audio: bool = True):
+    monitors = get_monitors()
+    source = detect_source_monitor(monitors, forced_source)
+    
+    externals = external_monitors(monitors, source)
+    if not externals:
+        log("No external monitors connected to toggle.")
+        notify("HDMI Display", "No external display connected.", "video-display", "low")
+        return
+
+    # Check if any external monitor is currently mirroring
+    names = [m["name"] for m in externals]
+    if any(m.get("mirrorOf", "none") == source for m in externals):
+        log("Currently mirroring. Switching to Extended Mode...")
+        set_extend(names, source)
+    else:
+        log("Currently extending. Switching to Mirror Mode...")
+        set_mirror(names, source, manage_audio)
+
+
+def handle_event(event_line: str, forced_source: str = "", manage_audio: bool = True):
+    event_line = event_line.strip()
+    if not event_line:
+        return
+
+    if ">>" not in event_line:
+        return
+
+    event_name, data = event_line.split(">>", 1)
+    
+    if event_name in ("monitoradded", "monitoraddedv2"):
+        log(f"Event received: {event_name} -> {data}")
+        # Allow Hyprland and DRM driver 400ms to negotiate EDID and modes
+        time.sleep(0.4)
+        sync_monitors(forced_source=forced_source, manage_audio=manage_audio, mode="mirror")
+
+    elif event_name in ("monitorremoved", "monitorremovedv2"):
+        log(f"Event received: {event_name} -> {data}")
+        notify("Display Disconnected", f"External display {data.split(',')[0]} disconnected", "video-display", "low")
+        if manage_audio:
+            time.sleep(0.3)
+            restore_default_audio()
+
+
+def run_daemon(forced_source: str = "", manage_audio: bool = True):
+    log("Starting HDMI Auto-Mirror Daemon...")
+    
+    # Acquire singleton lock
+    try:
+        lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+    except (IOError, BlockingIOError):
+        log("Another instance of hdmi-auto-mirror daemon is already running. Exiting.")
+        sys.exit(0)
+
+    while True:
+        backend = detect_backend()
+        if backend == "hyprland":
+            run_hyprland_loop(forced_source, manage_audio)
+        elif backend == "gnome":
+            run_gnome_loop(forced_source, manage_audio)
+        else:
+            time.sleep(2)
+
+
+def initial_sync(forced_source: str, manage_audio: bool):
+    try:
+        sync_monitors(forced_source=forced_source, manage_audio=manage_audio, mode="mirror")
+    except Exception as e:
+        log(f"Initial sync error: {e}")
+
+
+def run_hyprland_loop(forced_source: str, manage_audio: bool):
+    socket_path = get_hyprland_socket_path()
+    if not socket_path:
+        return
+
+    initial_sync(forced_source, manage_audio)
+    try:
+        log(f"Connecting to Hyprland IPC socket: {socket_path}")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            log("Connected to Hyprland socket2. Listening for monitor hotplug events...")
+
+            buffer = ""
+            while True:
+                chunk = client.recv(4096).decode("utf-8", errors="ignore")
+                if not chunk:
+                    log("Socket connection closed by compositor.")
+                    return
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    handle_event(line, forced_source=forced_source, manage_audio=manage_audio)
+
+    except Exception as e:
+        log(f"Socket connection error: {e}. Reconnecting in 3 seconds...")
+        time.sleep(3)
+
+
+def run_gnome_loop(forced_source: str, manage_audio: bool):
+    from gi.repository import Gio, GLib
+
+    def connected_externals() -> set[str]:
+        monitors = get_gnome_monitors()
+        if not monitors:
+            return set()
+        source = detect_source_monitor(monitors, forced_source)
+        return {m["name"] for m in external_monitors(monitors, source)}
+
+    initial_sync(forced_source, manage_audio)
+    known = connected_externals()
+    pending = 0
+
+    # MonitorsChanged also fires for our own changes, so only a different set of
+    # connected displays counts as a hotplug.
+    def check_hotplug():
+        nonlocal known, pending
+        pending = 0
+        try:
+            current = connected_externals()
+            added, removed = current - known, known - current
+            known = current
+            if added:
+                log(f"Display connected: {', '.join(sorted(added))}")
+                time.sleep(0.4)
+                sync_monitors(forced_source=forced_source, manage_audio=manage_audio, mode="mirror")
+            if removed:
+                log(f"Display disconnected: {', '.join(sorted(removed))}")
+                notify("Display Disconnected", f"External display {', '.join(sorted(removed))} disconnected", "video-display", "low")
+                if manage_audio and not current:
+                    time.sleep(0.3)
+                    restore_default_audio()
+        except Exception as e:
+            log(f"Hotplug handling error: {e}")
+        return False
+
+    def on_monitors_changed(*_):
+        nonlocal pending
+        if pending:
+            GLib.source_remove(pending)
+        pending = GLib.timeout_add(600, check_hotplug)
+
+    loop = GLib.MainLoop()
+
+    def on_owner_changed(_conn, _sender, _path, _iface, _signal, params):
+        if not params.unpack()[2]:
+            log("GNOME session ended.")
+            loop.quit()
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    subscriptions = [
+        bus.signal_subscribe(
+            MUTTER_BUS, MUTTER_BUS, "MonitorsChanged", MUTTER_PATH, None,
+            Gio.DBusSignalFlags.NONE, on_monitors_changed,
+        ),
+        bus.signal_subscribe(
+            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+            "/org/freedesktop/DBus", MUTTER_BUS, Gio.DBusSignalFlags.NONE, on_owner_changed,
+        ),
+    ]
+    log("Connected to GNOME display config. Listening for monitor hotplug events...")
+    loop.run()
+    for subscription in subscriptions:
+        bus.signal_unsubscribe(subscription)
+
+
+def print_status(forced_source: str = ""):
+    monitors = get_monitors()
+    source = detect_source_monitor(monitors, forced_source)
+    sinks = get_audio_sinks()
+
+    print("==========================================")
+    print("        HDMI Auto-Mirror Status           ")
+    print("==========================================")
+    print(f"Desktop: {detect_backend() or 'unsupported'}")
+    print(f"Primary / Source Display: {source}")
+    print("\nMonitors:")
+    for m in monitors:
+        name = m.get("name", "unknown")
+        desc = m.get("description", "")
+        res = f"{m.get('width')}x{m.get('height')}@{m.get('refreshRate', 0):.2f}Hz"
+        mirror = m.get("mirrorOf", "none")
+        role = "[SOURCE]" if name == source else f"[MIRROR of {mirror}]" if mirror != "none" else "[EXTENDED]"
+        print(f"  * {name:<10} {res:<20} {role:<18} ({desc})")
+
+    print("\nAudio Sinks:")
+    for s in sinks:
+        print(f"  * [{s['id']}] {s['name']} ({s.get('state', '')})")
+    print("==========================================")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HDMI Auto-Mirror and Audio Routing Tool for Hyprland and GNOME")
+    parser.add_argument("--daemon", "-d", action="store_true", help="Run as background daemon listening to hotplug events")
+    parser.add_argument("--mirror", "-m", action="store_true", help="Mirror all external monitors to primary display now")
+    parser.add_argument("--extend", "-e", action="store_true", help="Extend desktop across external monitors now")
+    parser.add_argument("--toggle", "-t", action="store_true", help="Toggle between Mirror and Extend modes")
+    parser.add_argument("--status", "-s", action="store_true", help="Show current monitor and mirror status")
+    parser.add_argument("--source", type=str, default="", help="Override primary/source monitor name (default: auto-detected eDP-1)")
+    parser.add_argument("--no-audio", action="store_true", help="Disable automatic audio routing to HDMI/TV")
+
+    args = parser.parse_args()
+    manage_audio = not args.no_audio
+
+    if args.daemon:
+        run_daemon(forced_source=args.source, manage_audio=manage_audio)
+    elif args.mirror:
+        sync_monitors(forced_source=args.source, manage_audio=manage_audio, mode="mirror")
+    elif args.extend:
+        sync_monitors(forced_source=args.source, manage_audio=manage_audio, mode="extend")
+    elif args.toggle:
+        toggle_display_mode(forced_source=args.source, manage_audio=manage_audio)
+    elif args.status:
+        print_status(forced_source=args.source)
+    else:
+        # Default behavior if run without args: show status and run sync check
+        print_status(forced_source=args.source)
+        print("\nChecking and applying screen mirror to any connected external display...")
+        sync_monitors(forced_source=args.source, manage_audio=manage_audio, mode="mirror")
+
+
+if __name__ == "__main__":
+    main()
